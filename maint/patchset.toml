@@ -76,3 +76,10 @@ file = "0081-package-publishing.patch"
 critical = false
 contracts = []
 
+
+# Feature: login-free local model providers (non-critical; skippable on upstream conflict).
+[[patch]]
+id = "local-provider"
+file = "0090-local-provider.patch"
+critical = false
+contracts = []

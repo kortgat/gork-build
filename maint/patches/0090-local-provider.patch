@@ -1,0 +1,2119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: charl <vanniekerk.charl@gmail.com>
+Date: Sat, 3 Oct 2026 18:36:59 +0200
+Subject: [PATCH] local-provider: skip login and set up a local model provider
+
+The login screen and the sign-in-in-progress screens offer "s  skip login
+(local model)". Skipping opens a setup modal (also `/local-provider`) for
+Ollama, LM Studio, llama.cpp, vLLM, or any OpenAI-compatible endpoint, with
+model auto-detection from {base_url}/models.
+
+Saving writes [model.<key>] with its own api_key plus [models].default (and
+session_summary when unset) to ~/.grok/config.toml (0600), hot-reloads the
+agent's models, and authenticates with xai.api_key, which the agent already
+accepts when a model carries its own credential. Later launches skip the
+login screen.
+
+Gork-Patch-Id: local-provider
+Gork-Invariant: local-provider-login-skip
+Gork-Risk: medium
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../docs/user-guide/02-authentication.md      |   6 +
+ .../docs/user-guide/04-slash-commands.md      |   4 +
+ .../docs/user-guide/11-custom-models.md       |  16 +
+ .../codegen/xai-grok-pager/src/app/actions.rs |  30 +
+ .../xai-grok-pager/src/app/app_view.rs        |  78 +-
+ .../xai-grok-pager/src/app/app_view_tests.rs  |   1 +
+ .../xai-grok-pager/src/app/dispatch/auth.rs   |   2 +-
+ .../src/app/dispatch/local_provider.rs        | 150 +++
+ .../xai-grok-pager/src/app/dispatch/mod.rs    |   1 +
+ .../xai-grok-pager/src/app/dispatch/router.rs |   9 +
+ .../src/app/dispatch/task_result.rs           |   7 +
+ .../src/app/dispatch/tests/local_provider.rs  | 199 ++++
+ .../src/app/dispatch/tests/mod.rs             |   2 +
+ .../xai-grok-pager/src/app/effects/mod.rs     |  60 ++
+ .../xai-grok-pager/src/config_toml_edit.rs    | 140 +++
+ .../src/slash/commands/local_provider.rs      |  22 +
+ .../xai-grok-pager/src/slash/commands/mod.rs  |   2 +
+ .../src/views/local_provider_modal.rs         | 915 ++++++++++++++++++
+ .../codegen/xai-grok-pager/src/views/mod.rs   |   1 +
+ .../xai-grok-pager/src/views/welcome/mod.rs   |  34 +-
+ .../src/session/slash_commands.rs             |   1 +
+ 21 files changed, 1673 insertions(+), 7 deletions(-)
+ create mode 100644 crates/codegen/xai-grok-pager/src/app/dispatch/local_provider.rs
+ create mode 100644 crates/codegen/xai-grok-pager/src/app/dispatch/tests/local_provider.rs
+ create mode 100644 crates/codegen/xai-grok-pager/src/slash/commands/local_provider.rs
+ create mode 100644 crates/codegen/xai-grok-pager/src/views/local_provider_modal.rs
+
+diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md b/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md
+index 5e321a673fb17420d67c9c40c93387b99686d827..a92a3f7f0b5c83ba0b33dd404114e04d69d1330f 100644
+--- a/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md
++++ b/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md
+@@ -41,6 +41,12 @@ To sign out, run `grok logout`. It takes no flags and clears your cached credent
+ 
+ ---
+ 
++## Skip Login (Local Models)
++
++To run without a Grok account, for example against Ollama, press `s` on the login screen. This opens the local provider setup, which saves a model with its own credential to `config.toml`. Grok then authenticates without signing in to xAI. See [Custom Models](11-custom-models.md#local-provider-setup-ui).
++
++---
++
+ ## API Key
+ 
+ For CI/CD, automation, or environments without browser access, use an API key from [console.x.ai](https://console.x.ai):
+diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
+index 28a67a1caa1e6b7134492300dfc58de356bd3104..a8540d2aece7800642afb529f70335c037996f54 100644
+--- a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
++++ b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
+@@ -391,6 +391,10 @@ Aliases: `/tour`, `/onboarding`
+ 
+ Open the Claude import modal to bring over `~/.claude` settings: permissions, environment variables, MCP servers, hooks, and paths.
+ 
++### `/local-provider`
++
++Open the local model provider setup: pick Ollama, LM Studio, llama.cpp server, vLLM, or a custom OpenAI-compatible endpoint, detect the installed models, and save one as the default. See [Custom Models](11-custom-models.md#local-provider-setup-ui).
++
+ ---
+ 
+ ## Agents and Personas
+diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md b/crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md
+index 4e3bf802a395f986862f85d9146ae9c1b35222a2..6cc1df2cd439ef4e939766c049dbc3bfc460511e 100644
+--- a/crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md
++++ b/crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md
+@@ -271,6 +271,22 @@ auth_provider = "bedrock"
+ context_window = 500000
+ ```
+ 
++### Local Provider Setup (UI)
++
++You do not need a Grok account to use a local model. On the login screen, press `s` (**Skip login (use a local model)**). In a session, run `/local-provider`. Either one opens a setup form:
++
++| Field | Notes |
++|-------|-------|
++| Provider | `←`/`→` cycles Ollama, LM Studio, llama.cpp server, vLLM, and Custom; each one fills in its default base URL |
++| Base URL | OpenAI-compatible root, e.g. `http://localhost:11434/v1` |
++| Model | Detected from `{base_url}/models` when the form opens or the URL changes (`Ctrl+R` re-detects, `Ctrl+N`/`Ctrl+P` cycles) |
++| API key | Optional. Local servers ignore it; when you leave it blank, the placeholder `local` is written |
++| Context window | Optional. Defaults to 200,000 tokens |
++
++`Enter` saves the model as a `[model.<provider>-<model>]` entry in `~/.grok/config.toml` and sets it as `[models] default`. If `[models] session_summary` is unset, it is pinned to the same model, so session titles don't go to a Grok model the local server doesn't have. The file is written owner-only (`0600`). Because the entry has its own `api_key`, Grok authenticates without an xAI login, and later launches skip the login screen. If a local model is already configured, `s` on the login screen signs in with it immediately.
++
++Built-in Grok models still need `grok login` or `XAI_API_KEY`.
++
+ ### Ollama (Local Models)
+ 
+ Run models locally with [Ollama](https://ollama.ai):
+diff --git a/crates/codegen/xai-grok-pager/src/app/actions.rs b/crates/codegen/xai-grok-pager/src/app/actions.rs
+index f16022895b121d7ad9cbc9b2ed12a08bdcd81cea..e19fed7b890523557adbca9354a1bf9c5a3ab236 100644
+--- a/crates/codegen/xai-grok-pager/src/app/actions.rs
++++ b/crates/codegen/xai-grok-pager/src/app/actions.rs
+@@ -114,6 +114,16 @@ pub enum Action {
+     ImportClaudeConfirm,
+     /// User cancelled the import modal: close without applying.
+     ImportClaudeCancel,
++    /// Login screen "Skip login": authenticate with a configured local model, or open the local provider setup.
++    SkipLogin,
++    /// Open the local model provider setup modal (`/local-provider`).
++    OpenLocalProviderSetup,
++    /// Probe the base URL in the local provider modal for installed models.
++    DetectLocalModels,
++    /// Validate and save the local provider modal.
++    SaveLocalProvider,
++    /// Close the local provider modal without saving.
++    CancelLocalProviderSetup,
+     /// Hide the import-claude menu row by recording the current `.claude/` content hash as "seen".
+     /// Doesn't import anything, doesn't change runtime fallback behavior.
+     /// The menu reappears only if `.claude/` content changes.
+@@ -1617,6 +1627,16 @@ pub enum Effect {
+         /// Threaded through to `SwitchModelComplete` so `IncompatibleAgent` can roll back.
+         prev_model_id: Option<acp::ModelId>,
+     },
++    /// GET `{base_url}/models` for the local provider modal.
++    DetectLocalModels {
++        request_seq: u64,
++        base_url: String,
++        api_key: String,
++    },
++    /// Write the local provider's `[model.*]` entry to config.toml, then ask the agent to reload its model list.
++    SaveLocalProvider {
++        config: crate::views::local_provider_modal::LocalProviderConfig,
++    },
+     /// Fetch changelog from CDN (both markdown and structured JSON).
+     /// Runs off the render path via `spawn_blocking`.
+     /// Result is cached on `AppView` so `/release-notes` and the welcome screen share it.
+@@ -2659,6 +2679,16 @@ pub enum TaskResult {
+         /// Forwarded from `Effect::SwitchModel.prev_model_id` for rollback on `IncompatibleAgent`.
+         prev_model_id: Option<acp::ModelId>,
+     },
++    /// Result of [`Effect::DetectLocalModels`].
++    LocalModelsDetected {
++        request_seq: u64,
++        result: Result<Vec<String>, String>,
++    },
++    /// Result of [`Effect::SaveLocalProvider`].
++    LocalProviderSaved {
++        config: crate::views::local_provider_modal::LocalProviderConfig,
++        result: Result<(), String>,
++    },
+     /// Changelog fetched from CDN (both formats).
+     ChangelogFetched {
+         markdown: Option<String>,
+diff --git a/crates/codegen/xai-grok-pager/src/app/app_view.rs b/crates/codegen/xai-grok-pager/src/app/app_view.rs
+index 3ed214701e583607ca58d331e22af3e1c695a7c4..5f678b83e5c4864f5c683ff1b36881ad2315e301 100644
+--- a/crates/codegen/xai-grok-pager/src/app/app_view.rs
++++ b/crates/codegen/xai-grok-pager/src/app/app_view.rs
+@@ -1091,6 +1091,8 @@ pub struct AppView {
+     pub has_claude_import: bool,
+     /// When set, the welcome screen renders an interactive import modal instead of normal content.
+     pub import_claude_modal: Option<crate::views::import_claude_modal::ImportClaudeModalState>,
++    /// Local model provider setup modal (login screen "Skip login" or `/local-provider`).
++    pub local_provider_modal: Option<crate::views::local_provider_modal::LocalProviderModalState>,
+     /// Doc viewer overlay for the welcome screen (release notes via Ctrl+L).
+     pub welcome_doc_viewer: Option<crate::views::modal::ActiveModal>,
+     /// Whether the pager uses fullscreen (alt-screen) or inline mode.
+@@ -1591,6 +1593,7 @@ impl AppView {
+             relaunch: None,
+             has_claude_import: false,
+             import_claude_modal: None,
++            local_provider_modal: None,
+             welcome_doc_viewer: None,
+             screen_mode: ScreenMode::Inline,
+             pending_screen_mode_switch: None,
+@@ -2491,6 +2494,7 @@ impl AppView {
+                     sp_entries_query: &self.session_picker_entries_query,
+                     has_claude_import: self.has_claude_import,
+                     import_claude_modal: &mut self.import_claude_modal,
++                    local_provider_modal: &mut self.local_provider_modal,
+                     welcome_doc_viewer: &mut self.welcome_doc_viewer,
+                     changelog_markdown: &self.changelog_markdown,
+                     show_changelog_action: self.welcome_show_changelog_action,
+@@ -2653,6 +2657,9 @@ impl AppView {
+                         return InputOutcome::Action(Action::DashboardOverlayExit);
+                     }
+                 }
++                if let Some(modal) = self.local_provider_modal.as_mut() {
++                    return local_provider_modal_input(modal, ev);
++                }
+                 if let Some(modal) = self.import_claude_modal.as_mut() {
+                     use crate::views::import_claude_modal::ImportClaudeModalOutcome;
+                     let outcome_to_input = |o: ImportClaudeModalOutcome| match o {
+@@ -3152,6 +3159,8 @@ struct WelcomeInputCtx<'a> {
+     sp_entries_query: &'a Option<String>,
+     has_claude_import: bool,
+     import_claude_modal: &'a mut Option<crate::views::import_claude_modal::ImportClaudeModalState>,
++    local_provider_modal:
++        &'a mut Option<crate::views::local_provider_modal::LocalProviderModalState>,
+     welcome_doc_viewer: &'a mut Option<crate::views::modal::ActiveModal>,
+     changelog_markdown: &'a Option<String>,
+     /// Whether the welcome menu currently includes a "Changelog" row (above Quit), so index-to-action mapping accounts for it.
+@@ -3182,8 +3191,33 @@ struct WelcomeInputCtx<'a> {
+     #[cfg(feature = "local-workspace")]
+     session_picker_open: bool,
+ }
++/// Route input to the local provider modal; it swallows everything while open.
++fn local_provider_modal_input(
++    modal: &mut crate::views::local_provider_modal::LocalProviderModalState,
++    ev: &Event,
++) -> InputOutcome {
++    use crate::views::local_provider_modal::LocalProviderModalOutcome as O;
++    let outcome = match ev {
++        Event::Key(key) if key.kind == KeyEventKind::Release => return InputOutcome::Unchanged,
++        Event::Key(key) => modal.handle_key(key),
++        Event::Mouse(mouse) => modal.handle_mouse(mouse.kind, mouse.column, mouse.row),
++        Event::Paste(text) => modal.insert_paste(text),
++        Event::Resize(..) => O::Changed,
++        _ => O::Unchanged,
++    };
++    match outcome {
++        O::Cancelled => InputOutcome::Action(Action::CancelLocalProviderSetup),
++        O::Submit => InputOutcome::Action(Action::SaveLocalProvider),
++        O::Detect => InputOutcome::Action(Action::DetectLocalModels),
++        O::Changed => InputOutcome::Changed,
++        O::Unchanged => InputOutcome::Unchanged,
++    }
++}
+ /// Welcome view input: overlays first, then composer, then the menu.
+ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutcome {
++    if let Some(modal) = ctx.local_provider_modal.as_mut() {
++        return local_provider_modal_input(modal, ev);
++    }
+     if let Some(modal) = ctx.import_claude_modal.as_mut() {
+         use crate::views::import_claude_modal::ImportClaudeModalOutcome;
+         let outcome_to_input = |o: ImportClaudeModalOutcome| match o {
+@@ -3785,6 +3819,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
+                 if key!('l').matches(key) || key!(Enter).matches(key) {
+                     return InputOutcome::Action(Action::Login);
+                 }
++                if key!('s').matches(key) {
++                    return InputOutcome::Action(Action::SkipLogin);
++                }
+             }
+             AuthState::Authenticating { .. } if *ctx.show_raw_url => {
+                 if key!('q', CONTROL).matches(key) || key!('c', CONTROL).matches(key) {
+@@ -3805,6 +3842,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
+                     }
+                     return InputOutcome::Action(Action::QuitConfirmed);
+                 }
++                if key!('s', CONTROL).matches(key) {
++                    return InputOutcome::Action(Action::SkipLogin);
++                }
+                 if key!(Enter).matches(key) {
+                     let trimmed = ctx.auth_code_input.text().trim().to_string();
+                     if !trimmed.is_empty() {
+@@ -3845,6 +3885,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
+                     }
+                     return InputOutcome::Action(Action::QuitConfirmed);
+                 }
++                if key!('s').matches(key) || key!('s', CONTROL).matches(key) {
++                    return InputOutcome::Action(Action::SkipLogin);
++                }
+             }
+         }
+     }
+@@ -4125,7 +4168,8 @@ fn handle_menu_nav(
+ fn dispatch_pending_menu_action(index: usize) -> InputOutcome {
+     match index {
+         0 => InputOutcome::Action(Action::Login),
+-        1 => InputOutcome::Action(Action::Quit),
++        1 => InputOutcome::Action(Action::SkipLogin),
++        2 => InputOutcome::Action(Action::Quit),
+         _ => InputOutcome::Unchanged,
+     }
+ }
+@@ -4637,6 +4681,16 @@ impl AppView {
+                                     compact,
+                                 );
+                             }
++                            if let Some(modal) = self.local_provider_modal.as_mut() {
++                                let theme = crate::theme::Theme::current();
++                                crate::views::local_provider_modal::render_local_provider_modal(
++                                    f.buffer_mut(),
++                                    view_area,
++                                    modal,
++                                    &theme,
++                                    compact,
++                                );
++                            }
+                             if let Some(dialog) = self.new_worktree_dialog.as_ref() {
+                                 crate::views::new_worktree_dialog::render_new_worktree_dialog(
+                                     view_area,
+@@ -4691,7 +4745,10 @@ impl AppView {
+                                 panel.render(full_area, f.buffer_mut());
+                             }
+                             let has_cloud_modal = false;
+-                            let cursor = if has_cloud_modal || self.tutorial.is_some() {
++                            let cursor = if has_cloud_modal
++                                || self.tutorial.is_some()
++                                || self.local_provider_modal.is_some()
++                            {
+                                 None
+                             } else {
+                                 result.cursor_pos
+@@ -4827,6 +4884,16 @@ impl AppView {
+                                         compact,
+                                     );
+                                 }
++                                if let Some(modal) = self.local_provider_modal.as_mut() {
++                                    let theme = crate::theme::Theme::current();
++                                    crate::views::local_provider_modal::render_local_provider_modal(
++                                        f.buffer_mut(),
++                                        view_area,
++                                        modal,
++                                        &theme,
++                                        compact,
++                                    );
++                                }
+                                 if let Some(tutorial) = self.tutorial.as_mut() {
+                                     crate::views::tutorial::render_tutorial(
+                                         f.buffer_mut(),
+@@ -4845,11 +4912,15 @@ impl AppView {
+                                 let has_cloud = false;
+                                 if has_cloud
+                                     || self.import_claude_modal.is_some()
++                                    || self.local_provider_modal.is_some()
+                                     || self.tutorial.is_some()
+                                 {
+                                     link_spans.clear();
+                                 }
+-                                let cursor = if has_cloud || self.tutorial.is_some() {
++                                let cursor = if has_cloud
++                                    || self.tutorial.is_some()
++                                    || self.local_provider_modal.is_some()
++                                {
+                                     None
+                                 } else {
+                                     cursor_pos
+@@ -5128,6 +5199,7 @@ impl AppView {
+         let cloud_modal_open = false;
+         matches!(self.active_view, ActiveView::Agent(id) if self.agents.get(&id).is_some_and(|a| a.extensions_modal.is_some() || a.active_modal.is_some()))
+             || self.import_claude_modal.is_some()
++            || self.local_provider_modal.is_some()
+             || self.new_worktree_dialog.is_some()
+             || self.welcome_doc_viewer.is_some()
+             || self.tutorial.is_some()
+diff --git a/crates/codegen/xai-grok-pager/src/app/app_view_tests.rs b/crates/codegen/xai-grok-pager/src/app/app_view_tests.rs
+index 483296d4697c71d3bb2be8022bd49bc3c5a4f512..92846b3612275d09d12bab07a844e6cf6f2ed6ee 100644
+--- a/crates/codegen/xai-grok-pager/src/app/app_view_tests.rs
++++ b/crates/codegen/xai-grok-pager/src/app/app_view_tests.rs
+@@ -272,6 +272,7 @@ pub(crate) fn test_app() -> AppView {
+         relaunch: None,
+         has_claude_import: false,
+         import_claude_modal: None,
++        local_provider_modal: None,
+         welcome_doc_viewer: None,
+         screen_mode: ScreenMode::Inline,
+         pending_screen_mode_switch: None,
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/auth.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/auth.rs
+index 769d63a9f1ec79754baf9bdf18f1758dbcdb1aa8..8d512c346846988fb7ff22185a61da89e66fd7d1 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/auth.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/auth.rs
+@@ -49,7 +49,7 @@ fn no_login_method_error(app: &AppView) -> String {
+ /// Abort any in-flight Authenticate/SwitchAccount task *and* its URL poll (single-flight).
+ /// A new login must not stack device-code mints or let a stale poll steal the successor's URL.
+ /// No-op when not authenticating or when the abort handles have not been installed yet.
+-fn abort_prior_auth(app: &mut AppView) {
++pub(super) fn abort_prior_auth(app: &mut AppView) {
+     if let AuthState::Authenticating {
+         handle,
+         request_seq,
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/local_provider.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/local_provider.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ae2c5a321909908b6e33e8762950ca26a1f6f5c
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/local_provider.rs
+@@ -0,0 +1,150 @@
++//! Local model provider setup (Ollama and other OpenAI-compatible servers) and the login screen's "Skip login".
++//!
++//! A saved provider is a `[model.<key>]` entry with its own `api_key`, which lets the agent accept `xai.api_key`
++//! auth without any xAI credential. Skipping login is therefore "authenticate with `xai.api_key`".
++
++use crate::app::actions::Effect;
++use crate::app::app_view::{ActiveView, AppView, AuthMode, AuthState};
++use crate::scrollback::block::RenderBlock;
++use crate::views::local_provider_modal::{Detection, LocalProviderConfig, LocalProviderModalState};
++use xai_grok_shell::agent::auth_method::XAI_API_KEY_METHOD_ID;
++
++/// Login screen "Skip login": use an already-advertised API-key method (a configured local model or `XAI_API_KEY`),
++/// otherwise open the setup modal so the user can add one.
++pub(super) fn dispatch_skip_login(app: &mut AppView) -> Vec<Effect> {
++    // Startup auto-starts the browser/device sign-in; skipping abandons it here and in the shell.
++    let mut effects = Vec::new();
++    if let AuthState::Authenticating { request_seq, .. } = app.auth_state {
++        super::auth::abort_prior_auth(app);
++        app.next_auth_request_seq += 1;
++        app.auth_show_raw_url = false;
++        app.auth_state = AuthState::Pending { error: None };
++        effects.push(Effect::CancelAuth { request_seq });
++    }
++    let api_key_advertised = app
++        .auth_methods
++        .iter()
++        .any(|m| m.id().0.as_ref() == XAI_API_KEY_METHOD_ID);
++    if api_key_advertised {
++        effects.extend(authenticate_without_account(app));
++    } else {
++        effects.extend(dispatch_open_local_provider_setup(app));
++    }
++    effects
++}
++
++pub(super) fn dispatch_open_local_provider_setup(app: &mut AppView) -> Vec<Effect> {
++    let mut modal = LocalProviderModalState::new();
++    let effect = start_detection(&mut modal);
++    app.local_provider_modal = Some(modal);
++    effect.into_iter().collect()
++}
++
++pub(super) fn dispatch_detect_local_models(app: &mut AppView) -> Vec<Effect> {
++    let Some(modal) = app.local_provider_modal.as_mut() else {
++        return vec![];
++    };
++    start_detection(modal).into_iter().collect()
++}
++
++fn start_detection(modal: &mut LocalProviderModalState) -> Option<Effect> {
++    if modal.base_url().is_empty() {
++        modal.detection = Detection::Failed("enter a base URL first".to_string());
++        return None;
++    }
++    let request_seq = modal.begin_detection();
++    Some(Effect::DetectLocalModels {
++        request_seq,
++        base_url: modal.base_url().to_string(),
++        api_key: modal.api_key().to_string(),
++    })
++}
++
++pub(super) fn dispatch_save_local_provider(app: &mut AppView) -> Vec<Effect> {
++    let Some(modal) = app.local_provider_modal.as_mut() else {
++        return vec![];
++    };
++    match modal.validate() {
++        Ok(config) => {
++            modal.error = None;
++            vec![Effect::SaveLocalProvider { config }]
++        }
++        Err(e) => {
++            modal.error = Some(e);
++            vec![]
++        }
++    }
++}
++
++pub(super) fn dispatch_cancel_local_provider_setup(app: &mut AppView) -> Vec<Effect> {
++    app.local_provider_modal = None;
++    vec![]
++}
++
++pub(super) fn handle_local_models_detected(
++    app: &mut AppView,
++    request_seq: u64,
++    result: Result<Vec<String>, String>,
++) -> Vec<Effect> {
++    if let Some(modal) = app.local_provider_modal.as_mut() {
++        modal.finish_detection(request_seq, result);
++    }
++    vec![]
++}
++
++pub(super) fn handle_local_provider_saved(
++    app: &mut AppView,
++    config: LocalProviderConfig,
++    result: Result<(), String>,
++) -> Vec<Effect> {
++    if let Err(e) = result {
++        // Keep the form open so nothing typed is lost.
++        if let Some(modal) = app.local_provider_modal.as_mut() {
++            modal.error = Some(e);
++        }
++        return vec![];
++    }
++    app.local_provider_modal = None;
++    if matches!(app.auth_state, AuthState::Pending { .. }) {
++        return authenticate_without_account(app);
++    }
++    let notice = format!(
++        "Saved {} as the default model for new sessions. Switch this session with /model {}.",
++        config.display_name, config.key
++    );
++    match app.active_view {
++        ActiveView::Agent(id) if app.agents.contains_key(&id) => {
++            if let Some(agent) = app.agents.get_mut(&id) {
++                agent.scrollback.push_block(RenderBlock::system(notice));
++            }
++        }
++        _ => app.startup_warnings.push(crate::startup::StartupWarning {
++            severity: crate::startup::WarningSeverity::Info,
++            message: notice,
++            action: None,
++        }),
++    }
++    vec![]
++}
++
++/// Authenticate with the `xai.api_key` method. The agent accepts it when `XAI_API_KEY` is set or any configured model
++/// carries its own credential; otherwise the error comes back through `AuthFailed` onto the login screen.
++fn authenticate_without_account(app: &mut AppView) -> Vec<Effect> {
++    let request_seq = app.next_auth_request_seq;
++    app.next_auth_request_seq += 1;
++    app.auth_code_input.reset();
++    app.auth_state = AuthState::Authenticating {
++        request_seq,
++        handle: None,
++        auth_url: None,
++        mode: AuthMode::Pending,
++    };
++    app.is_api_key_auth = true;
++    app.usage_visible = false;
++    vec![Effect::Authenticate {
++        request_seq,
++        method_id: agent_client_protocol::AuthMethodId::new(XAI_API_KEY_METHOD_ID),
++        use_oauth: false,
++        force_interactive: false,
++    }]
++}
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/mod.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/mod.rs
+index b04f0f9cc6df674192b1d6a90d909d4bcfb9a7b7..67179c6f0c8840472e23614b0cd9861a9c4b10a3 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/mod.rs
+@@ -20,6 +20,7 @@ mod import_claude;
+ mod inline_feedback;
+ mod interject;
+ mod jump;
++mod local_provider;
+ mod modes;
+ pub(crate) mod notes;
+ mod permissions;
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs
+index 89c36b27dfd70832c5a7121ee857cae77c358d90..aa4527e2a6ad9372175d065fcc92fe19a42bcd2b 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs
+@@ -281,6 +281,15 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
+         Action::ImportClaudeSettings => dispatch_import_claude(app),
+         Action::ImportClaudeConfirm => dispatch_import_claude_confirm(app),
+         Action::ImportClaudeCancel => dispatch_import_claude_cancel(app),
++        Action::SkipLogin => super::local_provider::dispatch_skip_login(app),
++        Action::OpenLocalProviderSetup => {
++            super::local_provider::dispatch_open_local_provider_setup(app)
++        }
++        Action::DetectLocalModels => super::local_provider::dispatch_detect_local_models(app),
++        Action::SaveLocalProvider => super::local_provider::dispatch_save_local_provider(app),
++        Action::CancelLocalProviderSetup => {
++            super::local_provider::dispatch_cancel_local_provider_setup(app)
++        }
+         Action::DismissClaudeImport => dispatch_dismiss_claude_import(app),
+         Action::LoadSession(session_id, session_cwd, chat_kind) => {
+             dispatch_load_session(app, session_id, session_cwd, chat_kind)
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/task_result.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/task_result.rs
+index b00317f2d8ad4ac2bac15d45bafcbf722f2e3edc..5ee21b0f6e4ea4626bfc21c804a104aadc47fe66 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/task_result.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/task_result.rs
+@@ -999,6 +999,13 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
+             }
+             vec![]
+         }
++        TaskResult::LocalModelsDetected {
++            request_seq,
++            result,
++        } => super::local_provider::handle_local_models_detected(app, request_seq, result),
++        TaskResult::LocalProviderSaved { config, result } => {
++            super::local_provider::handle_local_provider_saved(app, config, result)
++        }
+         TaskResult::ChangelogFetched { markdown, entries } => {
+             app.changelog_markdown = markdown;
+             app.changelog_bullets =
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/local_provider.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/local_provider.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2bc043b201b59de31b4287b7dc21563961d85ea1
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/local_provider.rs
+@@ -0,0 +1,199 @@
++//! Tests for the login screen's "Skip login" and the local provider setup modal.
++
++use super::*;
++use crate::views::local_provider_modal::{Detection, LocalProviderConfig};
++
++fn pending_app() -> AppView {
++    let mut app = test_app();
++    app.auth_state = AuthState::Pending { error: None };
++    app
++}
++
++fn sample_config() -> LocalProviderConfig {
++    LocalProviderConfig {
++        key: "ollama-llama3.1-8b".into(),
++        model: "llama3.1:8b".into(),
++        base_url: "http://localhost:11434/v1".into(),
++        display_name: "llama3.1:8b (Ollama)".into(),
++        api_key: "local".into(),
++        context_window: None,
++    }
++}
++
++fn is_api_key_authenticate(effect: &Effect) -> bool {
++    matches!(
++        effect,
++        Effect::Authenticate { method_id, force_interactive: false, .. }
++            if method_id.0.as_ref() == xai_grok_shell::agent::auth_method::XAI_API_KEY_METHOD_ID
++    )
++}
++
++#[test]
++fn skip_login_without_local_model_opens_setup_and_detects() {
++    let mut app = pending_app();
++    let effects = dispatch(Action::SkipLogin, &mut app);
++    let modal = app
++        .local_provider_modal
++        .as_ref()
++        .expect("setup modal opens");
++    assert_eq!(modal.detection, Detection::Running);
++    assert!(matches!(
++        effects.as_slice(),
++        [Effect::DetectLocalModels { base_url, .. }] if base_url == "http://localhost:11434/v1"
++    ));
++    assert!(matches!(app.auth_state, AuthState::Pending { .. }));
++}
++
++#[test]
++fn skip_login_with_advertised_api_key_authenticates_directly() {
++    let mut app = pending_app();
++    app.auth_methods.insert(
++        0,
++        acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
++            acp::AuthMethodId::new(xai_grok_shell::agent::auth_method::XAI_API_KEY_METHOD_ID),
++            "API key".to_string(),
++        )),
++    );
++    let effects = dispatch(Action::SkipLogin, &mut app);
++    assert!(app.local_provider_modal.is_none());
++    assert!(matches!(effects.as_slice(), [e] if is_api_key_authenticate(e)));
++    assert!(matches!(app.auth_state, AuthState::Authenticating { .. }));
++    assert!(app.is_api_key_auth);
++}
++
++#[test]
++fn save_with_invalid_form_shows_error_and_emits_nothing() {
++    let mut app = pending_app();
++    dispatch(Action::OpenLocalProviderSetup, &mut app);
++    let effects = dispatch(Action::SaveLocalProvider, &mut app);
++    assert!(effects.is_empty());
++    assert!(
++        app.local_provider_modal
++            .as_ref()
++            .and_then(|m| m.error.as_deref())
++            .is_some_and(|e| e.contains("Model is required"))
++    );
++}
++
++#[test]
++fn save_with_valid_form_emits_save_effect() {
++    let mut app = pending_app();
++    dispatch(Action::OpenLocalProviderSetup, &mut app);
++    app.local_provider_modal
++        .as_mut()
++        .unwrap()
++        .set_model("llama3.1:8b");
++    let effects = dispatch(Action::SaveLocalProvider, &mut app);
++    assert!(matches!(
++        effects.as_slice(),
++        [Effect::SaveLocalProvider { config }] if config.key == "ollama-llama3.1-8b"
++    ));
++}
++
++#[test]
++fn saved_on_login_screen_closes_modal_and_authenticates() {
++    let mut app = pending_app();
++    dispatch(Action::OpenLocalProviderSetup, &mut app);
++    let effects = dispatch(
++        Action::TaskComplete(TaskResult::LocalProviderSaved {
++            config: sample_config(),
++            result: Ok(()),
++        }),
++        &mut app,
++    );
++    assert!(app.local_provider_modal.is_none());
++    assert!(matches!(effects.as_slice(), [e] if is_api_key_authenticate(e)));
++}
++
++#[test]
++fn save_failure_keeps_modal_open_with_error() {
++    let mut app = pending_app();
++    dispatch(Action::OpenLocalProviderSetup, &mut app);
++    let effects = dispatch(
++        Action::TaskComplete(TaskResult::LocalProviderSaved {
++            config: sample_config(),
++            result: Err("Could not write config".into()),
++        }),
++        &mut app,
++    );
++    assert!(effects.is_empty());
++    assert_eq!(
++        app.local_provider_modal
++            .as_ref()
++            .and_then(|m| m.error.as_deref()),
++        Some("Could not write config")
++    );
++    assert!(matches!(app.auth_state, AuthState::Pending { .. }));
++}
++
++#[test]
++fn saved_while_signed_in_does_not_reauthenticate() {
++    let mut app = test_app();
++    app.auth_state = AuthState::Done;
++    dispatch(Action::OpenLocalProviderSetup, &mut app);
++    let effects = dispatch(
++        Action::TaskComplete(TaskResult::LocalProviderSaved {
++            config: sample_config(),
++            result: Ok(()),
++        }),
++        &mut app,
++    );
++    assert!(effects.is_empty());
++    assert!(app.local_provider_modal.is_none());
++    assert!(matches!(app.auth_state, AuthState::Done));
++    assert!(
++        app.startup_warnings
++            .iter()
++            .any(|w| w.message.contains("/model ollama-llama3.1-8b"))
++    );
++}
++
++#[test]
++fn stale_detection_result_is_dropped() {
++    let mut app = pending_app();
++    dispatch(Action::OpenLocalProviderSetup, &mut app);
++    dispatch(Action::DetectLocalModels, &mut app);
++    dispatch(
++        Action::TaskComplete(TaskResult::LocalModelsDetected {
++            request_seq: 1,
++            result: Ok(vec!["old".into()]),
++        }),
++        &mut app,
++    );
++    assert_eq!(
++        app.local_provider_modal.as_ref().unwrap().detection,
++        Detection::Running
++    );
++    dispatch(
++        Action::TaskComplete(TaskResult::LocalModelsDetected {
++            request_seq: 2,
++            result: Ok(vec!["new".into()]),
++        }),
++        &mut app,
++    );
++    assert!(matches!(
++        &app.local_provider_modal.as_ref().unwrap().detection,
++        Detection::Found { models, .. } if models == &vec!["new".to_string()]
++    ));
++}
++
++#[test]
++fn skip_during_startup_sign_in_cancels_it_and_opens_setup() {
++    let mut app = pending_app();
++    app.auth_state = AuthState::Authenticating {
++        request_seq: 7,
++        handle: None,
++        auth_url: Some("https://example/device".into()),
++        mode: AuthMode::Device,
++    };
++    let effects = dispatch(Action::SkipLogin, &mut app);
++    assert!(matches!(app.auth_state, AuthState::Pending { error: None }));
++    assert!(app.local_provider_modal.is_some());
++    assert!(matches!(
++        effects.as_slice(),
++        [
++            Effect::CancelAuth { request_seq: 7 },
++            Effect::DetectLocalModels { .. }
++        ]
++    ));
++}
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs
+index bf64193d8f09867c08b2ca1707eea3cbd8740859..61944d374c660e8d8990cb45c335fce34082da64 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs
+@@ -4,6 +4,7 @@ mod billing;
+ mod cta_e2e;
+ mod dashboard;
+ mod jump;
++mod local_provider;
+ mod mid_text_btw;
+ mod mid_text_goal;
+ mod modes;
+@@ -283,6 +284,7 @@ fn test_app() -> AppView {
+         trust_quit_error: None,
+         relaunch: None,
+         import_claude_modal: None,
++        local_provider_modal: None,
+         welcome_doc_viewer: None,
+         screen_mode: crate::app::ScreenMode::Inline,
+         pending_screen_mode_switch: None,
+diff --git a/crates/codegen/xai-grok-pager/src/app/effects/mod.rs b/crates/codegen/xai-grok-pager/src/app/effects/mod.rs
+index 1c5076975ad02c72139a9318f50ba1c92d471ad5..da12bf0db33b34869583ef765fd13e682943f0b7 100644
+--- a/crates/codegen/xai-grok-pager/src/app/effects/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/app/effects/mod.rs
+@@ -2120,6 +2120,66 @@ pub(crate) fn execute(
+                     }
+                 });
+         }
++        Effect::DetectLocalModels {
++            request_seq,
++            base_url,
++            api_key,
++        } => {
++            tasks
++                .spawn(async move {
++                    let result = crate::views::local_provider_modal::detect_models(
++                            base_url,
++                            api_key,
++                        )
++                        .await;
++                    TaskResult::LocalModelsDetected {
++                        request_seq,
++                        result,
++                    }
++                });
++        }
++        Effect::SaveLocalProvider { config } => {
++            let tx = acp_tx.clone();
++            tasks
++                .spawn(async move {
++                    let path = xai_grok_tools::util::grok_home::grok_home()
++                        .join(xai_grok_config::USER_CONFIG_FILENAME);
++                    let write = {
++                        let path = path.clone();
++                        let config = config.clone();
++                        tokio::task::spawn_blocking(move || {
++                                crate::config_toml_edit::upsert_local_model(&path, &config)
++                            })
++                            .await
++                    };
++                    let result = match write {
++                        Ok(Ok(())) => {
++                            // The config watcher reloads too, but only after its debounce; reload now so auth sees the model.
++                            let req = acp::ExtRequest::new(
++                                "x.ai/internal/reload_models",
++                                serde_json::value::to_raw_value(&serde_json::json!({}))
++                                    .expect("serialize reload_models params")
++                                    .into(),
++                            );
++                            acp_send(req, &tx)
++                                .await
++                                .map(|_| ())
++                                .map_err(|e| {
++                                    format!(
++                                        "Saved to {}, but the agent could not reload models: {e}",
++                                        path.display()
++                                    )
++                                })
++                        }
++                        Ok(Err(e)) => Err(format!("Could not write {}: {e}", path.display())),
++                        Err(e) => Err(format!("Could not write {}: {e}", path.display())),
++                    };
++                    TaskResult::LocalProviderSaved {
++                        config,
++                        result,
++                    }
++                });
++        }
+         Effect::FetchChangelog => {
+             tasks
+                 .spawn(async move {
+diff --git a/crates/codegen/xai-grok-pager/src/config_toml_edit.rs b/crates/codegen/xai-grok-pager/src/config_toml_edit.rs
+index 34a9c3305858341d2ef937677673e2cb880c2782..0c56fda7cc5fa2bca1a2c4b564c1d51ac02e986e 100644
+--- a/crates/codegen/xai-grok-pager/src/config_toml_edit.rs
++++ b/crates/codegen/xai-grok-pager/src/config_toml_edit.rs
+@@ -52,9 +52,149 @@ fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> st
+     std::fs::write(path, doc.to_string())
+ }
+ 
++/// Write `[model.<key>]` for a local provider and make it `[models].default`, preserving every other key and table.
++/// Refuses (error) rather than clobbering a non-blank config that does not parse.
++pub(crate) fn upsert_local_model(
++    path: &Path,
++    cfg: &crate::views::local_provider_modal::LocalProviderConfig,
++) -> std::io::Result<()> {
++    if let Some(parent) = path.parent() {
++        std::fs::create_dir_all(parent)?;
++    }
++    let Some(mut doc) = read_config_document_for_edit(path) else {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidData,
++            "config.toml is not valid TOML; fix it or add the model by hand",
++        ));
++    };
++    let model_tables = doc
++        .entry("model")
++        .or_insert(toml_edit::table())
++        .as_table_mut()
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidData,
++                "`model` in config.toml is not a table",
++            )
++        })?;
++    // Implicit parent so the file reads `[model.<key>]` rather than an empty `[model]` header.
++    model_tables.set_implicit(true);
++    let mut entry = toml_edit::Table::new();
++    entry.insert("model", toml_edit::value(cfg.model.as_str()));
++    entry.insert("base_url", toml_edit::value(cfg.base_url.as_str()));
++    entry.insert("name", toml_edit::value(cfg.display_name.as_str()));
++    entry.insert("api_key", toml_edit::value(cfg.api_key.as_str()));
++    entry.insert("api_backend", toml_edit::value("chat_completions"));
++    if let Some(n) = cfg.context_window {
++        entry.insert("context_window", toml_edit::value(n as i64));
++    }
++    model_tables.insert(&cfg.key, toml_edit::Item::Table(entry));
++
++    let models = doc
++        .entry("models")
++        .or_insert(toml_edit::table())
++        .as_table_mut()
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidData,
++                "`models` in config.toml is not a table",
++            )
++        })?;
++    models.insert("default", toml_edit::value(cfg.key.as_str()));
++    // Titles/summaries otherwise go to a built-in Grok model at this model's base URL, which a local server rejects.
++    if !models.contains_key("session_summary") {
++        models.insert("session_summary", toml_edit::value(cfg.key.as_str()));
++    }
++    write_owner_only(path, &doc.to_string())
++}
++
++/// The entry may hold a real API key, so keep the file owner-only like `auth.json`.
++fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
++    std::fs::write(path, contents)?;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    fn local_cfg() -> crate::views::local_provider_modal::LocalProviderConfig {
++        crate::views::local_provider_modal::LocalProviderConfig {
++            key: "ollama-llama3.1-8b".into(),
++            model: "llama3.1:8b".into(),
++            base_url: "http://localhost:11434/v1".into(),
++            display_name: "llama3.1:8b (Ollama)".into(),
++            api_key: "local".into(),
++            context_window: Some(32768),
++        }
++    }
++
++    #[test]
++    fn upsert_local_model_writes_entry_and_default_preserving_siblings() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join(xai_grok_config::USER_CONFIG_FILENAME);
++        std::fs::write(
++            &path,
++            "[ui]\ncompact_mode = true\n\n[models]\ndefault = \"grok-4.5\"\n\n[model.other]\nmodel = \"x\"\n",
++        )
++        .unwrap();
++        upsert_local_model(&path, &local_cfg()).unwrap();
++        let body = std::fs::read_to_string(&path).unwrap();
++        let v: toml::Value = toml::from_str(&body).unwrap();
++        assert_eq!(v["ui"]["compact_mode"].as_bool(), Some(true));
++        assert_eq!(v["models"]["default"].as_str(), Some("ollama-llama3.1-8b"));
++        assert_eq!(
++            v["models"]["session_summary"].as_str(),
++            Some("ollama-llama3.1-8b")
++        );
++        assert_eq!(v["model"]["other"]["model"].as_str(), Some("x"));
++        let m = &v["model"]["ollama-llama3.1-8b"];
++        assert_eq!(m["model"].as_str(), Some("llama3.1:8b"));
++        assert_eq!(m["base_url"].as_str(), Some("http://localhost:11434/v1"));
++        assert_eq!(m["api_key"].as_str(), Some("local"));
++        assert_eq!(m["context_window"].as_integer(), Some(32768));
++        assert!(
++            !body.contains("[model]\n"),
++            "parent table stays implicit:\n{body}"
++        );
++    }
++
++    #[test]
++    fn upsert_local_model_keeps_an_existing_session_summary_pin() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join(xai_grok_config::USER_CONFIG_FILENAME);
++        std::fs::write(&path, "[models]\nsession_summary = \"mine\"\n").unwrap();
++        upsert_local_model(&path, &local_cfg()).unwrap();
++        let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
++        assert_eq!(v["models"]["session_summary"].as_str(), Some("mine"));
++    }
++
++    #[test]
++    fn upsert_local_model_creates_missing_file_and_refuses_broken_toml() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir
++            .path()
++            .join("nested")
++            .join(xai_grok_config::USER_CONFIG_FILENAME);
++        upsert_local_model(&path, &local_cfg()).unwrap();
++        let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
++        assert_eq!(
++            v["model"]["ollama-llama3.1-8b"]["model"].as_str(),
++            Some("llama3.1:8b")
++        );
++
++        std::fs::write(&path, "this is = = not toml").unwrap();
++        assert!(upsert_local_model(&path, &local_cfg()).is_err());
++        assert_eq!(
++            std::fs::read_to_string(&path).unwrap(),
++            "this is = = not toml"
++        );
++    }
+     use std::fs;
+     use tempfile::tempdir;
+ 
+diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/local_provider.rs b/crates/codegen/xai-grok-pager/src/slash/commands/local_provider.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cea9475b95de78678509fbdf7bf279ca2572466
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager/src/slash/commands/local_provider.rs
+@@ -0,0 +1,22 @@
++//! `/local-provider` opens the local model provider setup modal (Ollama, LM Studio, llama.cpp, vLLM, or any
++//! OpenAI-compatible server). The same modal backs the login screen's "Skip login".
++
++use crate::app::actions::Action;
++use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
++
++pub struct LocalProviderCommand;
++
++impl SlashCommand for LocalProviderCommand {
++    slash_meta! {
++        name: "local-provider",
++        description: "Set up a local model provider such as Ollama",
++        usage: "/local-provider",
++    }
++
++    fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
++        if !args.trim().is_empty() {
++            tracing::warn!("/local-provider does not accept arguments; ignoring");
++        }
++        CommandResult::Action(Action::OpenLocalProviderSetup)
++    }
++}
+diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs b/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
+index 05d93b081e2bceaaa225c9977243c29835d362a5..5f52918af75b85c67ceaf8006f76f3d83486a611 100644
+--- a/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
+@@ -31,6 +31,7 @@ pub mod imagine;
+ pub mod imagine_video;
+ pub mod import_claude;
+ pub mod jump;
++pub mod local_provider;
+ pub mod login;
+ pub mod logout;
+ pub mod loop_cmd;
+@@ -150,6 +151,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
+         Arc::new(privacy::PrivacyCommand),
+         Arc::new(doctor::DoctorCommand),
+         Arc::new(import_claude::ImportClaudeCommand),
++        Arc::new(local_provider::LocalProviderCommand),
+         Arc::new(login::LoginCommand),
+         Arc::new(logout::LogoutCommand),
+         Arc::new(home::HomeCommand),
+diff --git a/crates/codegen/xai-grok-pager/src/views/local_provider_modal.rs b/crates/codegen/xai-grok-pager/src/views/local_provider_modal.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b1890b6b2bcf77fe996220f0f8f0b7dcf5d2afd
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager/src/views/local_provider_modal.rs
+@@ -0,0 +1,915 @@
++//! Modal for configuring a local (or any OpenAI-compatible) model provider such as Ollama.
++//!
++//! Reachable from the login screen ("Skip login") and from `/local-provider` in a session.
++//! Saving writes a `[model.<key>]` entry plus `[models].default` to `~/.grok/config.toml`; the model carries its own
++//! credential, so the agent accepts `xai.api_key` auth without a Grok account and later launches skip the login screen.
++
++use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++use ratatui::buffer::Buffer;
++use ratatui::layout::Rect;
++use ratatui::style::{Modifier, Style};
++use ratatui::text::{Line, Span};
++use ratatui::widgets::{Paragraph, Widget, Wrap};
++
++use crate::input::line_editor::{LineEditOutcome, LineEditor};
++use crate::theme::Theme;
++use crate::views::modal_window::{
++    ModalSizing, ModalWindowConfig, ModalWindowOutcome, ModalWindowState, Shortcut,
++    handle_modal_mouse, render_modal_window,
++};
++
++const SHORTCUT_ID_HINT: usize = usize::MAX;
++const SHORTCUT_ID_DETECT: usize = 0;
++const SHORTCUT_ID_SAVE: usize = 1;
++const SHORTCUT_ID_CANCEL: usize = 2;
++
++/// Credential written when the user leaves the API key blank. Local servers ignore it, but a non-empty `api_key` is
++/// what marks the model as carrying its own credential (`has_own_credentials`), which unlocks login-free auth.
++pub const PLACEHOLDER_API_KEY: &str = "local";
++
++/// Width of the label column in the form.
++const LABEL_WIDTH: usize = 16;
++
++/// Well-known local servers that speak the OpenAI Chat Completions API.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ProviderPreset {
++    Ollama,
++    LmStudio,
++    LlamaCpp,
++    Vllm,
++    Custom,
++}
++
++impl ProviderPreset {
++    pub const ALL: [ProviderPreset; 5] = [
++        Self::Ollama,
++        Self::LmStudio,
++        Self::LlamaCpp,
++        Self::Vllm,
++        Self::Custom,
++    ];
++
++    pub fn label(self) -> &'static str {
++        match self {
++            Self::Ollama => "Ollama",
++            Self::LmStudio => "LM Studio",
++            Self::LlamaCpp => "llama.cpp server",
++            Self::Vllm => "vLLM",
++            Self::Custom => "Custom (OpenAI-compatible)",
++        }
++    }
++
++    pub fn default_base_url(self) -> &'static str {
++        match self {
++            Self::Ollama => "http://localhost:11434/v1",
++            Self::LmStudio => "http://localhost:1234/v1",
++            Self::LlamaCpp => "http://localhost:8080/v1",
++            Self::Vllm => "http://localhost:8000/v1",
++            Self::Custom => "",
++        }
++    }
++
++    /// Prefix for the generated `[model.<key>]` catalog key.
++    fn key_prefix(self) -> &'static str {
++        match self {
++            Self::Ollama => "ollama",
++            Self::LmStudio => "lmstudio",
++            Self::LlamaCpp => "llamacpp",
++            Self::Vllm => "vllm",
++            Self::Custom => "local",
++        }
++    }
++
++    fn cycle(self, forward: bool) -> Self {
++        step_in(&Self::ALL, self, forward)
++    }
++}
++
++/// The neighbour of `current` in `all`, wrapping at both ends.
++fn step_in<T: Copy + PartialEq>(all: &[T], current: T, forward: bool) -> T {
++    let n = all.len();
++    let i = all.iter().position(|x| *x == current).unwrap_or(0);
++    let next = if forward {
++        (i + 1) % n
++    } else {
++        (i + n - 1) % n
++    };
++    all.get(next).copied().unwrap_or(current)
++}
++
++/// Wrapping step through `0..len`; `len` must be non-zero.
++fn wrap_index(index: usize, len: usize, forward: bool) -> usize {
++    if forward {
++        (index + 1) % len
++    } else {
++        (index + len - 1) % len
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Field {
++    Preset,
++    BaseUrl,
++    Model,
++    ApiKey,
++    ContextWindow,
++}
++
++impl Field {
++    const ALL: [Field; 5] = [
++        Self::Preset,
++        Self::BaseUrl,
++        Self::Model,
++        Self::ApiKey,
++        Self::ContextWindow,
++    ];
++
++    fn label(self) -> &'static str {
++        match self {
++            Self::Preset => "Provider",
++            Self::BaseUrl => "Base URL",
++            Self::Model => "Model",
++            Self::ApiKey => "API key",
++            Self::ContextWindow => "Context window",
++        }
++    }
++
++    fn step(self, forward: bool) -> Self {
++        step_in(&Self::ALL, self, forward)
++    }
++}
++
++/// Result of probing `{base_url}/models`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Detection {
++    Idle,
++    Running,
++    Found { models: Vec<String>, index: usize },
++    Failed(String),
++}
++
++/// Validated form contents, ready to be written to `config.toml`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct LocalProviderConfig {
++    /// `[model.<key>]` catalog key, also the `/model` argument.
++    pub key: String,
++    pub model: String,
++    pub base_url: String,
++    pub display_name: String,
++    pub api_key: String,
++    pub context_window: Option<u64>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum LocalProviderModalOutcome {
++    Cancelled,
++    /// User asked to save (Enter / footer click). The caller validates via [`LocalProviderModalState::validate`].
++    Submit,
++    /// Base URL changed or user asked to (re)detect models.
++    Detect,
++    Changed,
++    Unchanged,
++}
++
++pub struct LocalProviderModalState {
++    pub preset: ProviderPreset,
++    base_url: LineEditor,
++    model: LineEditor,
++    api_key: LineEditor,
++    context_window: LineEditor,
++    pub focus: Field,
++    pub detection: Detection,
++    /// Sequence of the in-flight detection, so a stale result for an old URL is dropped.
++    pub detect_seq: u64,
++    /// Validation or save error shown under the form.
++    pub error: Option<String>,
++    pub window: ModalWindowState,
++    /// Row rects for click-to-focus; filled by the renderer.
++    field_rects: Vec<(Field, Rect)>,
++    /// The base URL the last detection ran against; leaving the URL field with a different value re-detects.
++    detected_url: String,
++    /// The model came from a detected list (not typed), so a later detection against another server may replace it.
++    model_from_detection: bool,
++}
++
++impl Default for LocalProviderModalState {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl LocalProviderModalState {
++    pub fn new() -> Self {
++        let preset = ProviderPreset::Ollama;
++        let mut base_url = LineEditor::default();
++        base_url.set_text(preset.default_base_url());
++        Self {
++            preset,
++            base_url,
++            model: LineEditor::default(),
++            api_key: LineEditor::default(),
++            context_window: LineEditor::default(),
++            focus: Field::Preset,
++            detection: Detection::Idle,
++            detect_seq: 0,
++            error: None,
++            window: ModalWindowState::new(),
++            field_rects: Vec::new(),
++            detected_url: String::new(),
++            model_from_detection: false,
++        }
++    }
++
++    pub fn base_url(&self) -> &str {
++        self.base_url.text().trim()
++    }
++
++    pub fn api_key(&self) -> &str {
++        self.api_key.text().trim()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn set_model(&mut self, model: &str) {
++        self.model.set_text(model);
++    }
++
++    #[cfg(test)]
++    pub(crate) fn set_context_window(&mut self, value: &str) {
++        self.context_window.set_text(value);
++    }
++
++    #[cfg(test)]
++    pub(crate) fn set_base_url(&mut self, value: &str) {
++        self.base_url.set_text(value);
++    }
++
++    /// Record that a detection for the current base URL has been started; returns its sequence number.
++    pub fn begin_detection(&mut self) -> u64 {
++        self.detect_seq += 1;
++        self.detected_url = self.base_url().to_string();
++        self.detection = Detection::Running;
++        self.detect_seq
++    }
++
++    /// Apply a detection result. Fills an empty model field with the first detected model.
++    pub fn finish_detection(&mut self, seq: u64, result: Result<Vec<String>, String>) {
++        if seq != self.detect_seq {
++            return;
++        }
++        self.detection = match result {
++            Ok(models) => {
++                let Some(first) = models.first().cloned() else {
++                    self.detection =
++                        Detection::Failed("server is up but reports no models".to_string());
++                    return;
++                };
++                let current = self.model.text().trim().to_string();
++                let found = models.iter().position(|m| *m == current);
++                let index = found.unwrap_or(0);
++                if current.is_empty() || (self.model_from_detection && found.is_none()) {
++                    self.model.set_text(first);
++                    self.model_from_detection = true;
++                }
++                Detection::Found { models, index }
++            }
++            Err(e) => Detection::Failed(e),
++        };
++    }
++
++    fn cycle_detected(&mut self, forward: bool) -> bool {
++        let Detection::Found { models, index } = &mut self.detection else {
++            return false;
++        };
++        if models.is_empty() {
++            return false;
++        }
++        *index = wrap_index(*index, models.len(), forward);
++        let Some(model) = models.get(*index).cloned() else {
++            return false;
++        };
++        self.model.set_text(model);
++        self.model_from_detection = true;
++        true
++    }
++
++    fn set_preset(&mut self, preset: ProviderPreset) {
++        // Only replace the URL when the user has not typed their own.
++        let url = self.base_url().to_string();
++        let url_is_a_default = ProviderPreset::ALL
++            .iter()
++            .any(|p| p.default_base_url() == url);
++        self.preset = preset;
++        if url_is_a_default {
++            self.base_url.set_text(preset.default_base_url());
++        }
++        self.detection = Detection::Idle;
++    }
++
++    fn editor_mut(&mut self, field: Field) -> Option<&mut LineEditor> {
++        match field {
++            Field::Preset => None,
++            Field::BaseUrl => Some(&mut self.base_url),
++            Field::Model => Some(&mut self.model),
++            Field::ApiKey => Some(&mut self.api_key),
++            Field::ContextWindow => Some(&mut self.context_window),
++        }
++    }
++
++    /// Move focus; leaving the URL field with an undetected URL asks the caller to detect.
++    fn move_focus(&mut self, next: Field) -> LocalProviderModalOutcome {
++        let leaving_url = self.focus == Field::BaseUrl && next != Field::BaseUrl;
++        self.focus = next;
++        if leaving_url && self.base_url() != self.detected_url && !self.base_url().is_empty() {
++            return LocalProviderModalOutcome::Detect;
++        }
++        LocalProviderModalOutcome::Changed
++    }
++
++    pub fn insert_paste(&mut self, text: &str) -> LocalProviderModalOutcome {
++        let text = crate::input::line_editor::sanitize_single_line(text);
++        let focus = self.focus;
++        match self.editor_mut(focus) {
++            Some(editor) => from_line_edit(editor.insert_paste(text.trim())),
++            None => LocalProviderModalOutcome::Unchanged,
++        }
++    }
++
++    pub fn handle_key(&mut self, key: &KeyEvent) -> LocalProviderModalOutcome {
++        if crate::input::key::is_paste_key(key) {
++            return crate::clipboard::system_clipboard_get()
++                .map_or(LocalProviderModalOutcome::Unchanged, |text| {
++                    self.insert_paste(&text)
++                });
++        }
++        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
++            && !crate::input::key::is_altgr(key.modifiers);
++        if ctrl {
++            return match key.code {
++                KeyCode::Char('c' | 'q') => LocalProviderModalOutcome::Cancelled,
++                KeyCode::Char('r') => LocalProviderModalOutcome::Detect,
++                KeyCode::Char('s') => LocalProviderModalOutcome::Submit,
++                KeyCode::Char('n') if self.cycle_detected(true) => {
++                    LocalProviderModalOutcome::Changed
++                }
++                KeyCode::Char('p') if self.cycle_detected(false) => {
++                    LocalProviderModalOutcome::Changed
++                }
++                _ => self.edit_focused(key),
++            };
++        }
++        match key.code {
++            KeyCode::Esc => LocalProviderModalOutcome::Cancelled,
++            KeyCode::Enter if key.modifiers.is_empty() => LocalProviderModalOutcome::Submit,
++            KeyCode::Tab | KeyCode::Down => self.move_focus(self.focus.step(true)),
++            KeyCode::BackTab | KeyCode::Up => self.move_focus(self.focus.step(false)),
++            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.focus == Field::Preset => {
++                self.set_preset(self.preset.cycle(key.code != KeyCode::Left));
++                LocalProviderModalOutcome::Detect
++            }
++            _ => self.edit_focused(key),
++        }
++    }
++
++    fn edit_focused(&mut self, key: &KeyEvent) -> LocalProviderModalOutcome {
++        let focus = self.focus;
++        let Some(editor) = self.editor_mut(focus) else {
++            return LocalProviderModalOutcome::Unchanged;
++        };
++        let outcome = if focus == Field::ContextWindow {
++            editor.handle_key_with_insert_policy(key, |c| c.is_ascii_digit())
++        } else {
++            editor.handle_key_with_insert_policy(key, |c| !c.is_control())
++        };
++        let result = from_line_edit(outcome);
++        if focus == Field::Model && outcome == LineEditOutcome::TextChanged {
++            self.model_from_detection = false;
++            // A typed model name no longer tracks the detected-list cursor.
++            if let Detection::Found { models, index } = &mut self.detection
++                && let Some(i) = models.iter().position(|m| m == self.model.text().trim())
++            {
++                *index = i;
++            }
++        }
++        if result == LocalProviderModalOutcome::Changed {
++            self.error = None;
++        }
++        result
++    }
++
++    pub fn handle_mouse(
++        &mut self,
++        kind: crossterm::event::MouseEventKind,
++        column: u16,
++        row: u16,
++    ) -> LocalProviderModalOutcome {
++        use crossterm::event::{MouseButton, MouseEventKind};
++        match handle_modal_mouse(&mut self.window, kind, column, row) {
++            ModalWindowOutcome::CloseRequested => return LocalProviderModalOutcome::Cancelled,
++            ModalWindowOutcome::ShortcutActivated(SHORTCUT_ID_DETECT) => {
++                return LocalProviderModalOutcome::Detect;
++            }
++            ModalWindowOutcome::ShortcutActivated(SHORTCUT_ID_SAVE) => {
++                return LocalProviderModalOutcome::Submit;
++            }
++            ModalWindowOutcome::ShortcutActivated(SHORTCUT_ID_CANCEL) => {
++                return LocalProviderModalOutcome::Cancelled;
++            }
++            ModalWindowOutcome::Handled => return LocalProviderModalOutcome::Changed,
++            _ => {}
++        }
++        if let MouseEventKind::Down(MouseButton::Left) = kind {
++            let hit = self
++                .field_rects
++                .iter()
++                .find(|(_, r)| r.contains(ratatui::layout::Position::new(column, row)))
++                .map(|(f, _)| *f);
++            if let Some(field) = hit {
++                if field == Field::Preset && self.focus == Field::Preset {
++                    self.set_preset(self.preset.cycle(true));
++                    return LocalProviderModalOutcome::Detect;
++                }
++                return self.move_focus(field);
++            }
++        }
++        LocalProviderModalOutcome::Unchanged
++    }
++
++    /// Validate the form and build the config entry, or return a message for the user.
++    pub fn validate(&self) -> Result<LocalProviderConfig, String> {
++        let base_url = self.base_url().trim_end_matches('/').to_string();
++        if base_url.is_empty() {
++            return Err("Base URL is required".to_string());
++        }
++        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
++            return Err("Base URL must start with http:// or https://".to_string());
++        }
++        let model = self.model.text().trim().to_string();
++        if model.is_empty() {
++            return Err("Model is required (Ctrl+R detects installed models)".to_string());
++        }
++        let context_window = match self.context_window.text().trim() {
++            "" => None,
++            s => match s.parse::<u64>() {
++                Ok(n) if n >= 1024 => Some(n),
++                _ => return Err("Context window must be a number of tokens (>= 1024)".to_string()),
++            },
++        };
++        let api_key = match self.api_key() {
++            "" => PLACEHOLDER_API_KEY.to_string(),
++            k => k.to_string(),
++        };
++        Ok(LocalProviderConfig {
++            key: model_key(self.preset, &model),
++            display_name: format!("{model} ({})", self.preset.label()),
++            model,
++            base_url,
++            api_key,
++            context_window,
++        })
++    }
++}
++
++fn from_line_edit(outcome: LineEditOutcome) -> LocalProviderModalOutcome {
++    match outcome {
++        LineEditOutcome::TextChanged
++        | LineEditOutcome::CursorChanged
++        | LineEditOutcome::HandledNoChange => LocalProviderModalOutcome::Changed,
++        LineEditOutcome::Unhandled => LocalProviderModalOutcome::Unchanged,
++    }
++}
++
++/// Build a `/model`-friendly catalog key: `<prefix>-<model>` lowercased, with runs of other characters collapsed to `-`.
++pub fn model_key(preset: ProviderPreset, model: &str) -> String {
++    let mut key = String::from(preset.key_prefix());
++    key.push('-');
++    let mut last_dash = true;
++    for c in model.chars().flat_map(char::to_lowercase) {
++        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
++            key.push(c);
++            last_dash = false;
++        } else if !last_dash {
++            key.push('-');
++            last_dash = true;
++        }
++    }
++    while key.ends_with('-') {
++        key.pop();
++    }
++    key
++}
++
++/// Parse an OpenAI-style `/models` response (`{"data":[{"id":..}]}`), also accepting Ollama's `/api/tags` shape
++/// (`{"models":[{"name":..}]}`).
++pub fn parse_models_response(body: &str) -> Result<Vec<String>, String> {
++    let v: serde_json::Value =
++        serde_json::from_str(body).map_err(|e| format!("unexpected response: {e}"))?;
++    let from = |list: Option<&serde_json::Value>, field: &str| -> Option<Vec<String>> {
++        list.and_then(|l| l.as_array()).map(|items| {
++            items
++                .iter()
++                .filter_map(|m| m.get(field).and_then(|s| s.as_str()).map(str::to_string))
++                .collect()
++        })
++    };
++    let mut models = from(v.get("data"), "id")
++        .or_else(|| from(v.get("models"), "name"))
++        .ok_or_else(|| "response has no model list".to_string())?;
++    models.sort();
++    models.dedup();
++    Ok(models)
++}
++
++/// GET `{base_url}/models` with a short timeout.
++pub async fn detect_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
++    let url = format!("{}/models", base_url.trim_end_matches('/'));
++    let mut req = xai_grok_shell::http::shared_client()
++        .get(&url)
++        .timeout(std::time::Duration::from_secs(4));
++    if !api_key.is_empty() {
++        req = req.bearer_auth(api_key);
++    }
++    let resp = req.send().await.map_err(|e| {
++        if e.is_connect() {
++            format!("cannot connect to {base_url} (is the server running?)")
++        } else if e.is_timeout() {
++            format!("timed out contacting {base_url}")
++        } else {
++            e.to_string()
++        }
++    })?;
++    let status = resp.status();
++    if !status.is_success() {
++        return Err(format!("{url} returned HTTP {}", status.as_u16()));
++    }
++    let body = resp.text().await.map_err(|e| e.to_string())?;
++    parse_models_response(&body)
++}
++
++/// Render the modal centered in `area`.
++pub fn render_local_provider_modal(
++    buf: &mut Buffer,
++    area: Rect,
++    state: &mut LocalProviderModalState,
++    theme: &Theme,
++    compact: bool,
++) {
++    let has_detected = matches!(state.detection, Detection::Found { .. });
++    let mut shortcuts = vec![
++        Shortcut {
++            label: "Tab/\u{2191}\u{2193} field",
++            clickable: false,
++            id: SHORTCUT_ID_HINT,
++        },
++        Shortcut {
++            label: "^R detect",
++            clickable: true,
++            id: SHORTCUT_ID_DETECT,
++        },
++    ];
++    if has_detected {
++        shortcuts.push(Shortcut {
++            label: "^N/^P model",
++            clickable: false,
++            id: SHORTCUT_ID_HINT,
++        });
++    }
++    shortcuts.push(Shortcut {
++        label: "Enter save",
++        clickable: true,
++        id: SHORTCUT_ID_SAVE,
++    });
++    shortcuts.push(Shortcut {
++        label: "Esc cancel",
++        clickable: true,
++        id: SHORTCUT_ID_CANCEL,
++    });
++    let config = ModalWindowConfig {
++        title: "Set up a local model provider",
++        tabs: None,
++        shortcuts: &shortcuts,
++        sizing: ModalSizing::medium().with_compact(compact),
++        fold_info: None,
++    };
++    let Some(areas) = render_modal_window(buf, area, &mut state.window, &config, theme) else {
++        return;
++    };
++    let content = areas.content;
++    state.field_rects.clear();
++
++    let label_style = Style::default().fg(theme.text_secondary);
++    let value_style = Style::default().fg(theme.text_primary);
++    let dim = Style::default().fg(theme.gray_dim);
++    let mut y = content.y;
++    let bottom = content.y + content.height;
++    let value_x = content.x + LABEL_WIDTH as u16 + 2;
++    let value_width = content.width.saturating_sub(LABEL_WIDTH as u16 + 2) as usize;
++
++    for field in Field::ALL {
++        if y >= bottom {
++            return;
++        }
++        let row = Rect::new(content.x, y, content.width, 1);
++        state.field_rects.push((field, row));
++        let focused = state.focus == field;
++        if focused {
++            buf.set_style(row, Style::default().bg(theme.bg_highlight));
++        }
++        let marker = if focused { "\u{203a} " } else { "  " };
++        let label = format!("{marker}{:<width$}", field.label(), width = LABEL_WIDTH);
++        let lstyle = if focused {
++            label_style.add_modifier(Modifier::BOLD)
++        } else {
++            label_style
++        };
++        buf.set_span(content.x, y, &Span::styled(label, lstyle), content.width);
++
++        match field {
++            Field::Preset => {
++                let text = format!("\u{2039} {} \u{203a}", state.preset.label());
++                buf.set_span(
++                    value_x,
++                    y,
++                    &Span::styled(text, value_style),
++                    value_width as u16,
++                );
++            }
++            _ => {
++                let placeholder = match field {
++                    Field::BaseUrl => "http://localhost:11434/v1",
++                    Field::Model => "e.g. qwen2.5-coder:7b",
++                    Field::ApiKey => "optional (local servers don't need one)",
++                    Field::ContextWindow => "optional, tokens (default 200000)",
++                    Field::Preset => "",
++                };
++                let masked = field == Field::ApiKey;
++                let editor = match field {
++                    Field::BaseUrl => &state.base_url,
++                    Field::Model => &state.model,
++                    Field::ApiKey => &state.api_key,
++                    _ => &state.context_window,
++                };
++                render_editor(
++                    buf,
++                    Rect::new(value_x, y, value_width as u16, 1),
++                    editor,
++                    focused,
++                    masked,
++                    placeholder,
++                    value_style,
++                    dim,
++                    theme,
++                );
++            }
++        }
++        if focused && theme.is_bandless() {
++            buf.set_style(row, Style::default().add_modifier(Modifier::REVERSED));
++        }
++        y += 1;
++    }
++
++    y += 1;
++    let mut status_lines: Vec<Line<'_>> = Vec::new();
++    match &state.detection {
++        Detection::Idle => status_lines.push(Line::from(Span::styled(
++            "Press Ctrl+R to list the models this server has installed.",
++            dim,
++        ))),
++        Detection::Running => status_lines.push(Line::from(Span::styled(
++            format!("Detecting models at {}\u{2026}", state.base_url()),
++            dim,
++        ))),
++        Detection::Found { models, index } => {
++            let mut spans = vec![Span::styled(
++                format!("\u{2713} {} model(s): ", models.len()),
++                Style::default().fg(theme.accent_success),
++            )];
++            for (i, m) in models.iter().enumerate() {
++                if i > 0 {
++                    spans.push(Span::styled(", ", dim));
++                }
++                let style = if i == *index {
++                    value_style.add_modifier(Modifier::BOLD)
++                } else {
++                    dim
++                };
++                spans.push(Span::styled(m.clone(), style));
++            }
++            status_lines.push(Line::from(spans));
++        }
++        Detection::Failed(e) => status_lines.push(Line::from(Span::styled(
++            format!("\u{2717} {e}"),
++            Style::default().fg(theme.accent_error),
++        ))),
++    }
++    if let Some(err) = &state.error {
++        status_lines.push(Line::from(Span::styled(
++            err.clone(),
++            Style::default().fg(theme.accent_error),
++        )));
++    }
++    status_lines.push(Line::from(""));
++    status_lines.push(Line::from(Span::styled(
++        "Saves to ~/.grok/config.toml as the default model. No Grok account needed.",
++        dim,
++    )));
++    if y < bottom {
++        Paragraph::new(status_lines)
++            .wrap(Wrap { trim: true })
++            .render(Rect::new(content.x, y, content.width, bottom - y), buf);
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
++fn render_editor(
++    buf: &mut Buffer,
++    area: Rect,
++    editor: &LineEditor,
++    focused: bool,
++    masked: bool,
++    placeholder: &str,
++    value_style: Style,
++    dim: Style,
++    theme: &Theme,
++) {
++    let width = area.width as usize;
++    if width == 0 {
++        return;
++    }
++    let text = editor.text();
++    if text.is_empty() {
++        if !focused {
++            buf.set_span(area.x, area.y, &Span::styled(placeholder, dim), area.width);
++        } else if let Some(cell) = buf.cell_mut((area.x, area.y)) {
++            cell.set_style(theme.block_cursor_over(theme.bg_highlight));
++        }
++        return;
++    }
++    let viewport = editor.viewport(width.saturating_sub(1));
++    let visible = &text[viewport.visible_byte_range.clone()];
++    let shown = if masked {
++        "\u{2022}".repeat(visible.chars().count())
++    } else {
++        visible.to_string()
++    };
++    buf.set_span(
++        area.x,
++        area.y,
++        &Span::styled(shown, value_style),
++        area.width,
++    );
++    if focused {
++        let cx = area.x + viewport.cursor_display_column as u16;
++        if let Some(cell) = buf.cell_mut((cx, area.y)) {
++            cell.set_style(theme.block_cursor_over(theme.bg_highlight));
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crossterm::event::KeyEventKind;
++
++    fn key(code: KeyCode) -> KeyEvent {
++        KeyEvent {
++            code,
++            modifiers: KeyModifiers::NONE,
++            kind: KeyEventKind::Press,
++            state: crossterm::event::KeyEventState::NONE,
++        }
++    }
++
++    fn ctrl(c: char) -> KeyEvent {
++        KeyEvent {
++            code: KeyCode::Char(c),
++            modifiers: KeyModifiers::CONTROL,
++            kind: KeyEventKind::Press,
++            state: crossterm::event::KeyEventState::NONE,
++        }
++    }
++
++    #[test]
++    fn model_key_is_slash_command_friendly() {
++        assert_eq!(
++            model_key(ProviderPreset::Ollama, "qwen2.5-coder:7b"),
++            "ollama-qwen2.5-coder-7b"
++        );
++        assert_eq!(
++            model_key(ProviderPreset::LmStudio, "Org/Model Name::Q4"),
++            "lmstudio-org-model-name-q4"
++        );
++        assert_eq!(model_key(ProviderPreset::Custom, "--"), "local");
++    }
++
++    #[test]
++    fn parses_openai_and_ollama_model_lists() {
++        let openai = r#"{"object":"list","data":[{"id":"b"},{"id":"a"},{"id":"a"}]}"#;
++        assert_eq!(parse_models_response(openai).unwrap(), vec!["a", "b"]);
++        let ollama = r#"{"models":[{"name":"llama3.1:8b"}]}"#;
++        assert_eq!(parse_models_response(ollama).unwrap(), vec!["llama3.1:8b"]);
++        assert!(parse_models_response("{}").is_err());
++        assert!(parse_models_response("not json").is_err());
++    }
++
++    #[test]
++    fn preset_cycle_replaces_default_url_but_keeps_custom_url() {
++        let mut s = LocalProviderModalState::new();
++        assert_eq!(s.base_url(), "http://localhost:11434/v1");
++        assert_eq!(
++            s.handle_key(&key(KeyCode::Right)),
++            LocalProviderModalOutcome::Detect
++        );
++        assert_eq!(s.preset, ProviderPreset::LmStudio);
++        assert_eq!(s.base_url(), "http://localhost:1234/v1");
++
++        s.set_base_url("http://gpu-box:9000/v1");
++        s.handle_key(&key(KeyCode::Right));
++        assert_eq!(s.preset, ProviderPreset::LlamaCpp);
++        assert_eq!(s.base_url(), "http://gpu-box:9000/v1");
++    }
++
++    #[test]
++    fn leaving_an_edited_url_requests_detection() {
++        let mut s = LocalProviderModalState::new();
++        s.handle_key(&key(KeyCode::Tab));
++        assert_eq!(s.focus, Field::BaseUrl);
++        s.handle_key(&key(KeyCode::Char('x')));
++        assert_eq!(
++            s.handle_key(&key(KeyCode::Tab)),
++            LocalProviderModalOutcome::Detect
++        );
++        assert_eq!(s.focus, Field::Model);
++    }
++
++    #[test]
++    fn detection_fills_empty_model_and_cycles() {
++        let mut s = LocalProviderModalState::new();
++        let seq = s.begin_detection();
++        s.finish_detection(seq, Ok(vec!["a".into(), "b".into()]));
++        assert_eq!(s.validate().unwrap().model, "a");
++        assert_eq!(s.handle_key(&ctrl('n')), LocalProviderModalOutcome::Changed);
++        assert_eq!(s.validate().unwrap().model, "b");
++        assert_eq!(s.handle_key(&ctrl('n')), LocalProviderModalOutcome::Changed);
++        assert_eq!(s.validate().unwrap().model, "a");
++    }
++
++    #[test]
++    fn redetecting_another_server_replaces_detected_but_keeps_typed_model() {
++        let mut s = LocalProviderModalState::new();
++        let seq = s.begin_detection();
++        s.finish_detection(seq, Ok(vec!["first-server".into()]));
++        let seq = s.begin_detection();
++        s.finish_detection(seq, Ok(vec!["second-server".into()]));
++        assert_eq!(s.validate().unwrap().model, "second-server");
++
++        s.focus = Field::Model;
++        s.handle_key(&key(KeyCode::Char('x')));
++        let seq = s.begin_detection();
++        s.finish_detection(seq, Ok(vec!["third-server".into()]));
++        assert_eq!(s.validate().unwrap().model, "second-serverx");
++    }
++
++    #[test]
++    fn stale_detection_is_ignored() {
++        let mut s = LocalProviderModalState::new();
++        let old = s.begin_detection();
++        let _new = s.begin_detection();
++        s.finish_detection(old, Ok(vec!["stale".into()]));
++        assert_eq!(s.detection, Detection::Running);
++    }
++
++    #[test]
++    fn validate_fills_placeholder_key_and_checks_inputs() {
++        let mut s = LocalProviderModalState::new();
++        assert!(s.validate().is_err(), "model is required");
++        s.set_model("llama3.1:8b");
++        let cfg = s.validate().unwrap();
++        assert_eq!(cfg.api_key, PLACEHOLDER_API_KEY);
++        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
++        assert_eq!(cfg.key, "ollama-llama3.1-8b");
++        assert_eq!(cfg.display_name, "llama3.1:8b (Ollama)");
++        assert_eq!(cfg.context_window, None);
++
++        s.set_context_window("32768");
++        assert_eq!(s.validate().unwrap().context_window, Some(32768));
++        s.set_context_window("12");
++        assert!(s.validate().is_err());
++        s.set_context_window("");
++
++        s.set_base_url("localhost:11434");
++        assert!(s.validate().is_err());
++    }
++
++    #[test]
++    fn context_window_accepts_digits_only() {
++        let mut s = LocalProviderModalState::new();
++        s.focus = Field::ContextWindow;
++        s.handle_key(&key(KeyCode::Char('4')));
++        s.handle_key(&key(KeyCode::Char('k')));
++        s.handle_key(&key(KeyCode::Char('0')));
++        s.handle_key(&key(KeyCode::Char('9')));
++        s.handle_key(&key(KeyCode::Char('6')));
++        s.set_model("m");
++        assert_eq!(s.validate().unwrap().context_window, Some(4096));
++    }
++}
+diff --git a/crates/codegen/xai-grok-pager/src/views/mod.rs b/crates/codegen/xai-grok-pager/src/views/mod.rs
+index dcbe4033d13ba40d12ba72a33503d5a23f140d0a..6cdf7fb1ba832f70318057d538fae131bb0d51d5 100644
+--- a/crates/codegen/xai-grok-pager/src/views/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/views/mod.rs
+@@ -21,6 +21,7 @@ pub mod history_search;
+ pub mod import_claude_modal;
+ pub mod jump;
+ pub mod list_pane;
++pub mod local_provider_modal;
+ pub(crate) mod location;
+ pub mod managed_connectors_wait;
+ pub mod mcps_modal;
+diff --git a/crates/codegen/xai-grok-pager/src/views/welcome/mod.rs b/crates/codegen/xai-grok-pager/src/views/welcome/mod.rs
+index b828a78072e79bcbe0d66e10a28cee1093a9ac5b..feace86b23fdc7591a291069a34829984873d696 100644
+--- a/crates/codegen/xai-grok-pager/src/views/welcome/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/views/welcome/mod.rs
+@@ -69,6 +69,29 @@ fn quit_hint_spans(theme: &Theme) -> Vec<Span<'static>> {
+     ]
+ }
+ 
++/// "skip login" hint shown beside quit while signing in; `key` is `s`, or `ctrl+s` where a paste box takes typed text.
++fn skip_hint_spans(theme: &Theme, key: &'static str) -> Vec<Span<'static>> {
++    vec![
++        Span::styled(
++            key,
++            Style::default()
++                .fg(theme.accent_user)
++                .add_modifier(Modifier::BOLD),
++        ),
++        Span::styled(
++            "  skip login (local model)    ",
++            Style::default().fg(theme.gray),
++        ),
++    ]
++}
++
++/// Skip + quit hints for the sign-in-in-progress screens.
++fn skip_and_quit_hint_spans(theme: &Theme) -> Vec<Span<'static>> {
++    let mut spans = skip_hint_spans(theme, "s");
++    spans.extend(quit_hint_spans(theme));
++    spans
++}
++
+ /// Style for a clickable welcome block: bright primary while `hovered`, else `base`.
+ /// Shared by the announcement and changelog renderers.
+ pub(super) fn hover_style(theme: &Theme, hovered: bool, base: Style) -> Style {
+@@ -793,7 +816,11 @@ pub fn render_welcome(
+         AuthState::Pending { error } => {
+             let label = params.login_label.unwrap_or("grok.com");
+             let login_text = format!("Login with {}", label);
+-            let menu = [("l", login_text.as_str()), ("q", "Quit")];
++            let menu = [
++                ("l", login_text.as_str()),
++                ("s", "Skip login (use a local model)"),
++                ("q", "Quit"),
++            ];
+             let msg = error.as_deref().map(|e| (e, theme.accent_error));
+             let info = PromptInfo {
+                 model_name: params.model_name,
+@@ -1398,7 +1425,7 @@ fn render_browser_status_arm(
+         (None, None)
+     };
+ 
+-    let hints = Line::from(quit_hint_spans(theme)).alignment(Alignment::Center);
++    let hints = Line::from(skip_and_quit_hint_spans(theme)).alignment(Alignment::Center);
+     Paragraph::new(hints).render(hint_area, buf);
+ 
+     (click_rect, fallback_rect)
+@@ -1516,6 +1543,7 @@ fn render_welcome_authenticating(
+                 ),
+                 Span::styled("  submit    ", Style::default().fg(theme.gray)),
+             ];
++            hint_spans.extend(skip_hint_spans(theme, "ctrl+s"));
+             hint_spans.extend(quit_hint_spans(theme));
+             let hints = Line::from(hint_spans).alignment(Alignment::Center);
+             Paragraph::new(hints).render(hint_area, buf);
+@@ -1569,7 +1597,7 @@ fn render_welcome_authenticating(
+             .alignment(Alignment::Center);
+             Paragraph::new(msg).render(msg_area, buf);
+ 
+-            let hints = Line::from(quit_hint_spans(theme)).alignment(Alignment::Center);
++            let hints = Line::from(skip_and_quit_hint_spans(theme)).alignment(Alignment::Center);
+             Paragraph::new(hints).render(hint_area, buf);
+ 
+             (None, None)
+diff --git a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs b/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
+index 806f78787efc22527cf1863d08564c695315e4c9..db586cb98b4ff548a955b8b27b4480e851bb1534 100644
+--- a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
++++ b/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
+@@ -492,6 +492,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
+     "imagine",
+     "imagine-video",
+     "import-claude",
++    "local-provider",
+     "jump",
+     "login",
+     "logout",
+
+base-commit: 4247f661689354b831191f11eeeac8424993fe3d
+prerequisite-patch-id: be79529fe47a8dbb5f7f7174e04a23cfeddc63f7
+prerequisite-patch-id: 1dfbf374d3a68129d96bb06c1026e41ab50363c4
+prerequisite-patch-id: d36844c4188ff12d6b8c1bb65cc44ab9c2a05f30
+prerequisite-patch-id: 8dec628511f56817ca256664dc0e4d43271c68fd
+prerequisite-patch-id: 68d52b2e9a6d5e48cea276eef3c218f72e9f6e9e
+prerequisite-patch-id: 467149b61fcd1aba9a9aa10efd491050c8a8f016
+prerequisite-patch-id: 64f0ec9605ebcdac1565a84ebd7259eea8836736
+prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
+prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
+prerequisite-patch-id: 03a586cf30cab3dbf6d755100a086c90a4939f22
+prerequisite-patch-id: bd012db60cc160de402da87dd4f961a90cf1a283
+-- 
+2.55.0
+
