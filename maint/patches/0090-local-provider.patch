@@ -40,8 +40,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../src/views/local_provider_modal.rs         | 915 ++++++++++++++++++
  .../codegen/xai-grok-pager/src/views/mod.rs   |   1 +
  .../xai-grok-pager/src/views/welcome/mod.rs   |  34 +-
+ .../src/agent/mvp_agent/session_setup.rs      |  16 +-
  .../src/session/slash_commands.rs             |   1 +
- 21 files changed, 1673 insertions(+), 7 deletions(-)
+ 22 files changed, 1687 insertions(+), 9 deletions(-)
  create mode 100644 crates/codegen/xai-grok-pager/src/app/dispatch/local_provider.rs
  create mode 100644 crates/codegen/xai-grok-pager/src/app/dispatch/tests/local_provider.rs
  create mode 100644 crates/codegen/xai-grok-pager/src/slash/commands/local_provider.rs
@@ -2089,6 +2090,40 @@ index b828a78072e79bcbe0d66e10a28cee1093a9ac5b..feace86b23fdc7591a291069a3482998
              Paragraph::new(hints).render(hint_area, buf);
  
              (None, None)
+diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
+index 8f85cb4d7b8fec8a2372015173f908a239f1cc85..535f565eeed21dbb6ce932f70792b7eb88adf4ee 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs
+@@ -1680,7 +1680,19 @@ impl MvpAgent {
+             "load_session: restoring persisted model (debug)"
+         );
+         let is_grok_build = persisted_model.0.starts_with("grok-build");
+-        let same_family_fallback = if is_grok_build {
++        // Prefer the user's configured default (e.g. a local model) over catalog order, so a vanished BYOK model
++        // never silently lands on a built-in model the user has no credentials for.
++        let configured_default = self
++            .cfg
++            .borrow()
++            .models
++            .default
++            .clone()
++            .map(acp::ModelId::new)
++            .filter(|id| {
++                available.contains_key(id) && id.0.starts_with("grok-build") == is_grok_build
++            });
++        let same_family_fallback = configured_default.or_else(|| if is_grok_build {
+             available
+                 .keys()
+                 .find(|id| id.0.starts_with("grok-build"))
+@@ -1690,7 +1702,7 @@ impl MvpAgent {
+                 .keys()
+                 .find(|id| !id.0.starts_with("grok-build"))
+                 .cloned()
+-        };
++        });
+         let selectable_catalog_key =
+             selectable_catalog_key_for_persisted(&models, &available, &persisted_model);
+         let model_id = if let Some(catalog_key) = selectable_catalog_key {
 diff --git a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs b/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
 index 806f78787efc22527cf1863d08564c695315e4c9..db586cb98b4ff548a955b8b27b4480e851bb1534 100644
 --- a/crates/codegen/xai-grok-shell/src/session/slash_commands.rs
